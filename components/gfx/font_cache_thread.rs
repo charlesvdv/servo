@@ -125,6 +125,7 @@ struct FontCache {
     generic_fonts: HashMap<FontFamily, LowercaseString>,
     local_families: HashMap<LowercaseString, FontTemplates>,
     web_families: HashMap<LowercaseString, FontTemplates>,
+    unfetched_families: HashMap<LowercaseString, EffectiveSources>,
     font_context: FontContextHandle,
     core_resource_thread: CoreResourceThread,
     webrender_api: Option<webrender_traits::RenderApi>,
@@ -165,7 +166,7 @@ impl FontCache {
 
             match msg {
                 Command::GetFontTemplate(family, descriptor, result) => {
-                    let maybe_font_template = self.find_font_template(&family, &descriptor);
+                    let maybe_font_template = self.find_font_template(&family, &descriptor, &result);
                     let _ = result.send(Reply::GetFontTemplateReply(maybe_font_template));
                 }
                 Command::GetLastResortFontTemplate(descriptor, result) => {
@@ -174,6 +175,7 @@ impl FontCache {
                 }
                 Command::AddWebFont(family_name, sources, result) => {
                     self.handle_add_web_font(family_name, sources, result);
+                    result.send(()).unwrap();
                 }
                 Command::AddDownloadedWebFont(family_name, url, bytes, result) => {
                     let templates = &mut self.web_families.get_mut(&family_name).unwrap();
@@ -192,6 +194,13 @@ impl FontCache {
                            family_name: LowercaseString,
                            mut sources: EffectiveSources,
                            sender: IpcSender<()>) {
+        self.unfetched_families.insert(family_name.clone(), sources);
+    }
+
+    fn get_web_font_from_source(&mut self,
+                           family_name: LowercaseString,
+                           mut sources: EffectiveSources,
+                           sender: IpcSender<(Reply)>) {
         let src = if let Some(src) = sources.next() {
             src
         } else {
@@ -264,6 +273,8 @@ impl FontCache {
                                                               bytes,
                                                               sender.clone());
                             channel_to_self.send(command).unwrap();
+
+                            sender.send(Reply::GetFontTemplateReply(maybe_font_template))
                         }
                     }
                 });
@@ -328,13 +339,16 @@ impl FontCache {
         }
     }
 
-    fn find_font_in_web_family(&mut self, family: &FontFamily, desc: &FontTemplateDescriptor)
+    fn find_font_in_web_family(&mut self, family: &FontFamily, desc: &FontTemplateDescriptor, sender: &IpcSender<(Reply)>)
                                 -> Option<Arc<FontTemplateData>> {
         let family_name = LowercaseString::new(family.name());
 
         if self.web_families.contains_key(&family_name) {
             let templates = self.web_families.get_mut(&family_name).unwrap();
             templates.find_font_for_style(desc, &self.font_context)
+        } else if self.unfetched_families.contains_key(&family_name) {
+            self.get_web_font_from_source(family_name, self.unfetched_families.remove(&family_name).unwrap(), sender);
+            None
         } else {
             None
         }
@@ -362,9 +376,9 @@ impl FontCache {
         }
     }
 
-    fn find_font_template(&mut self, family: &FontFamily, desc: &FontTemplateDescriptor)
+    fn find_font_template(&mut self, family: &FontFamily, desc: &FontTemplateDescriptor, sender: &IpcSender<(Reply)>)
                             -> Option<FontTemplateInfo> {
-        let template = self.find_font_in_web_family(family, desc)
+        let template = self.find_font_in_web_family(family, desc, sender)
             .or_else(|| {
                 let transformed_family = self.transform_family(family);
                 self.find_font_in_local_family(&transformed_family, desc)
@@ -414,6 +428,7 @@ impl FontCacheThread {
                 generic_fonts: generic_fonts,
                 local_families: HashMap::new(),
                 web_families: HashMap::new(),
+                unfetched_families: HashMap::new(),
                 font_context: FontContextHandle::new(),
                 core_resource_thread: core_resource_thread,
                 webrender_api: webrender_api,
